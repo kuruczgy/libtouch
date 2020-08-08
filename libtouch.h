@@ -4,6 +4,11 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+enum libtouch_groups {
+	LIBTOUCH_T,
+	LIBTOUCH_TSR,
+};
+
 /* Represents the affine transformation:
  * [ s -r t1 ]
  * [ r  s t2 ]
@@ -18,13 +23,10 @@ struct libtouch_rt {
 	};
 };
 
-/* Represents an axis-aligned bounding box. */
-struct aabb {
-	union {
-		struct { float x, y, w, h; };
-		struct { float pos[2]; float size[2]; };
-	};
-};
+/* We represent axis-aligned bounding boxes with a `float[4]`, where the first
+ * two items give the position of the upper left corner, and the last two items
+ * give the sizes.
+ */
 
 /* Utilities for dealing with rigid-body transformations. */
 extern const struct libtouch_rt libtouch_rt_identity;
@@ -36,9 +38,19 @@ float libtouch_rt_scaling(const struct libtouch_rt *rt);
 struct libtouch_surface;
 struct libtouch_area;
 
+struct libtouch_area_ops {
+	void *env;
+	void (*start)(void *env);
+	void (*move)(void *env, struct libtouch_rt rt);
+	void (*end)(void *env, struct libtouch_rt rt);
+};
+
 struct libtouch_surface *libtouch_surface_create();
-struct libtouch_area *libtouch_surface_add_area(
-	struct libtouch_surface *surf, struct aabb aabb);
+struct libtouch_area *libtouch_surface_add_area(struct libtouch_surface *surf,
+	const float *aabb, enum libtouch_groups g,
+	struct libtouch_area_ops ops);
+void libtouch_surface_remove_area(struct libtouch_surface *surf,
+	struct libtouch_area *area);
 void libtouch_surface_destroy(struct libtouch_surface *surf);
 
 /* Use these functions to inform a surface of touch events. */

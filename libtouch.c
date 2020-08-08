@@ -4,10 +4,18 @@
 #include <string.h>
 #include "libtouch.h"
 
+/* Represents an axis-aligned bounding box. */
+struct aabb {
+	union {
+		struct { float x, y, w, h; };
+		struct { float pos[2]; float size[2]; };
+	};
+};
+
 struct point_pair { float a[2], b[2]; };
 typedef bool(*point_pair_iterator)(void *cl, struct point_pair *res);
 
-/* 
+/*
  * This function is basically the core of the whole library.
  * See "Advanced algorithms for manipulating 2D objects on touch screens":
  * https://trepo.tuni.fi/bitstream/handle/123456789/24173/palen.pdf
@@ -62,13 +70,47 @@ struct libtouch_rt estimate_translation_scaling_rotation(
 		.t2 = (-b1 * acbd - a1 * adbc + a2 * d1 + b2 * d1) / g
 	};
 }
-
-bool aabb_contains(const struct aabb *aabb, const float p[static 2])
+struct libtouch_rt estimate_translation(void *cl, point_pair_iterator iter)
 {
-	return p[0] >= aabb->x
-		&& p[0] < aabb->x + aabb->w
-		&& p[1] >= aabb->y
-		&& p[1] < aabb->y + aabb->h;
+	float a1 = 0, b1 = 0, c1 = 0, d1 = 0;
+
+	int N = 0;
+	struct point_pair pair;
+	while (iter(cl, &pair)) {
+		++N;
+
+		float a = pair.a[0], b = pair.a[1];
+		float c = pair.b[0], d = pair.b[1];
+
+		a1 += a;
+		b1 += b;
+		c1 += c;
+		d1 += d;
+	}
+
+	if (N < 1) {
+		return libtouch_rt_identity;
+	}
+
+	return (struct libtouch_rt){
+		.s = 1,
+		.r = 0,
+		.t1 = (c1 - a1) / N,
+		.t2 = (d1 - b1) / N
+	};
+}
+
+static struct libtouch_rt (*est_fn[])(void *, point_pair_iterator) = {
+	[LIBTOUCH_T] = estimate_translation,
+	[LIBTOUCH_TSR] = estimate_translation_scaling_rotation
+};
+
+static bool aabb_contains(const float *aabb, const float p[static 2])
+{
+	return p[0] >= aabb[0]
+		&& p[0] < aabb[0] + aabb[2]
+		&& p[1] >= aabb[1]
+		&& p[1] < aabb[1] + aabb[3];
 }
 
 struct libtouch_rt libtouch_rt_mul(const struct libtouch_rt *a,
@@ -106,7 +148,7 @@ static void vec_realloc(struct vec *v)
 	assert(v->cap > v->len);
 	v->d = realloc(v->d, v->cap * v->itemsize);
 }
-void vec_append(struct vec *v, const void *n)
+static void vec_append(struct vec *v, const void *n)
 {
 	if (v->len == v->cap) {
 		v->cap *= 2;
@@ -118,12 +160,17 @@ void vec_append(struct vec *v, const void *n)
 	memcpy(v->d + v->len * v->itemsize, n, v->itemsize);
 	++v->len;
 }
-void *vec_get(struct vec *v, size_t i)
+static void *vec_get(struct vec *v, size_t i)
 {
 	assert(i >= 0 && i < v->len);
 	return v->d + i * v->itemsize;
 }
-void vec_remove(struct vec *v, size_t i)
+static const void *vec_get_c(const struct vec *v, size_t i)
+{
+	assert(i >= 0 && i < v->len);
+	return v->d + i * v->itemsize;
+}
+static void vec_remove(struct vec *v, size_t i)
 {
 	if (v->len > i + 1) {
 		memmove(v->d + i * v->itemsize, v->d + (i + 1) * v->itemsize,
@@ -131,11 +178,11 @@ void vec_remove(struct vec *v, size_t i)
 	}
 	--v->len;
 }
-void vec_init_empty(struct vec *v, size_t itemsize)
+static void vec_init_empty(struct vec *v, size_t itemsize)
 {
 	*v = (struct vec){ .d = 0, .len = 0, .cap = 0, .itemsize = itemsize };
 }
-void vec_finish(struct vec *v)
+static void vec_finish(struct vec *v)
 {
 	free(v->d);
 }
@@ -145,12 +192,12 @@ struct tp {
 
 	uint32_t start_t;
 	float start[2];
-	
+
 	uint32_t last_t;
 	float last[2];
 
-	/* the touchpoint is only processed by the area it starts in */
-	struct libtouch_area *area;
+	/* the touchpoint is only processed by the areas it starts in */
+	struct vec areas; /* vec<struct libtouch_area *> */
 };
 
 struct libtouch_surface {
@@ -163,7 +210,7 @@ struct libtouch_area {
 	struct libtouch_surface *surf;
 
 	/* the area, defined by an AABB */
-	struct aabb aabb;
+	const float *aabb;
 
 	/* number of touchpoints touching this area */
 	int n;
@@ -173,6 +220,12 @@ struct libtouch_area {
 
 	struct libtouch_rt F_accum, F_curr;
 	bool F_dirty;
+
+	/* user callbacks */
+	struct libtouch_area_ops ops;
+
+	/* estimation mode */
+	enum libtouch_groups g;
 };
 
 struct libtouch_surface *libtouch_surface_create()
@@ -183,17 +236,41 @@ struct libtouch_surface *libtouch_surface_create()
 	vec_init_empty(&surf->areas, sizeof(struct libtouch_area *));
 	return surf;
 }
-struct libtouch_area *libtouch_surface_add_area(
-		struct libtouch_surface *surf, struct aabb aabb)
+struct libtouch_area *libtouch_surface_add_area(struct libtouch_surface *surf,
+		const float *aabb, enum libtouch_groups g,
+		struct libtouch_area_ops ops)
 {
 	struct libtouch_area *area = calloc(1, sizeof(struct libtouch_area));
 	area->surf = surf;
 	area->aabb = aabb;
 	area->F_accum = area->F_curr = libtouch_rt_identity;
+	area->ops = ops;
+	area->g = g;
 
 	vec_append(&surf->areas, &area);
 
 	return area;
+}
+void libtouch_surface_remove_area(struct libtouch_surface *surf,
+		struct libtouch_area *area) {
+	for (size_t i = 0; i < area->surf->tps.len; ++i) {
+		struct tp *tp = vec_get(&area->surf->tps, i);
+		for (int k = 0; k < tp->areas.len; ++k) {
+			struct libtouch_area **a = vec_get(&tp->areas, k);
+			if (*a == area) {
+				vec_remove(&tp->areas, k);
+				break;
+			}
+		}
+	}
+	for (int i = 0; i < surf->areas.len; ++i) {
+		struct libtouch_area **a = vec_get(&surf->areas, i);
+		if (*a == area) {
+			vec_remove(&surf->areas, i);
+			free(area);
+			break;
+		}
+	}
 }
 void libtouch_surface_destroy(struct libtouch_surface *surf)
 {
@@ -203,6 +280,7 @@ void libtouch_surface_destroy(struct libtouch_surface *surf)
 	}
 	vec_finish(&surf->tps);
 	vec_finish(&surf->areas);
+	free(surf);
 }
 
 struct area_point_iter_cl {
@@ -214,8 +292,14 @@ static bool area_point_iter(void *_cl, struct point_pair *pair)
 	struct area_point_iter_cl *cl = _cl;
 	for (; cl->i < cl->area->surf->tps.len; ++cl->i) {
 		const struct tp *tp = vec_get(&cl->area->surf->tps, cl->i);
-		if (tp->area != cl->area) continue;
+		for (int k = 0; k < tp->areas.len; ++k) {
+			struct libtouch_area * const *a =
+				vec_get_c(&tp->areas, k);
+			if (*a == cl->area) goto ok;
+		}
+		continue;
 
+ok:
 		pair->a[0] = tp->start[0];
 		pair->a[1] = tp->start[1];
 		pair->b[0] = tp->last[0];
@@ -235,8 +319,7 @@ struct libtouch_rt libtouch_area_get_transform(struct libtouch_area *area)
 			.area = area,
 			.i = 0
 		};
-		struct libtouch_rt F = estimate_translation_scaling_rotation(
-			&cl, &area_point_iter);
+		struct libtouch_rt F = est_fn[area->g](&cl, &area_point_iter);
 		area->F_curr = libtouch_rt_mul(&F, &area->F_accum);
 		area->F_dirty = false;
 	}
@@ -250,17 +333,29 @@ static void area_accumulate(struct libtouch_area *area)
 	area->F_dirty = true;
 	for (size_t i = 0; i < area->surf->tps.len; ++i) {
 		struct tp *tp = vec_get(&area->surf->tps, i);
-		if (tp->area != area) continue;
+		for (int k = 0; k < tp->areas.len; ++k) {
+			struct libtouch_area * const *a =
+				vec_get_c(&tp->areas, k);
+			if (*a == area) goto ok;
+		}
+		continue;
 
+ok:
 		memcpy(tp->start, tp->last, sizeof(float) * 2);
 	}
 }
 
 static bool area_down(struct libtouch_area *area, const struct tp *tp)
 {
-	if (aabb_contains(&area->aabb, tp->start)) {
+	if (aabb_contains(area->aabb, tp->start)) {
 		area_accumulate(area);
 
+		if (area->n == 0) {
+			// first touchpoint, send start event
+			if (area->ops.start) {
+				area->ops.start(area->ops.env);
+			}
+		}
 		++area->n;
 		if (area->n > area->max_n) area->max_n = area->n;
 
@@ -274,6 +369,10 @@ static void area_up(struct libtouch_area *area, const struct tp *tp)
 	area_accumulate(area);
 	if (--area->n == 0) {
 		// last touchpoint left, we can dispatch gesture events
+		if (area->ops.end) {
+			area->ops.end(area->ops.env, area->F_accum);
+			area->F_accum = libtouch_rt_identity;
+		}
 	}
 }
 
@@ -281,6 +380,10 @@ static void area_motion(struct libtouch_area *area, const struct tp *tp,
 		uint32_t time, const float pos[static 2])
 {
 	area->F_dirty = true;
+	if (area->ops.move) {
+		area->ops.move(area->ops.env,
+			libtouch_area_get_transform(area));
+	}
 }
 
 void libtouch_surface_down(struct libtouch_surface *surf, uint32_t time,
@@ -292,15 +395,14 @@ void libtouch_surface_down(struct libtouch_surface *surf, uint32_t time,
 		.start = { pos[0], pos[1] },
 		.last_t = time,
 		.last = { pos[0], pos[1] },
-		.area = NULL
 	};
+	vec_init_empty(&tp.areas, sizeof(struct libtouch_area *));
 
 	/* find the area that contains this point */
 	for (size_t i = 0; i < surf->areas.len; ++i) {
 		struct libtouch_area **area = vec_get(&surf->areas, i);
 		if (area_down(*area, &tp)) {
-			tp.area = *area;
-			break;
+			vec_append(&tp.areas, area);
 		}
 	}
 
@@ -323,11 +425,14 @@ void libtouch_surface_up(struct libtouch_surface *surf, uint32_t time, int id)
 {
 	size_t tp_i = find_tp(surf, id);
 	struct tp *tp = vec_get(&surf->tps, tp_i);
-	if (tp->area) {
-		area_up(tp->area, tp);
+	for (int i = 0; i < tp->areas.len; ++i) {
+		struct libtouch_area *area =
+			*(struct libtouch_area **)vec_get(&tp->areas, i);
+		area_up(area, tp);
 	}
 
 	/* remove this tp from the list */
+	vec_finish(&tp->areas);
 	vec_remove(&surf->tps, tp_i);
 }
 void libtouch_surface_motion(struct libtouch_surface *surf, uint32_t time,
@@ -336,8 +441,10 @@ void libtouch_surface_motion(struct libtouch_surface *surf, uint32_t time,
 	size_t tp_i = find_tp(surf, id);
 	struct tp *tp = vec_get(&surf->tps, tp_i);
 
-	if (tp->area) {
-		area_motion(tp->area, tp, time, pos);
+	for (int i = 0; i < tp->areas.len; ++i) {
+		struct libtouch_area *area =
+			*(struct libtouch_area **)vec_get(&tp->areas, i);
+		area_motion(area, tp, time, pos);
 	}
 	tp->last_t = time;
 	memcpy(tp->last, pos, sizeof(float) * 2);
