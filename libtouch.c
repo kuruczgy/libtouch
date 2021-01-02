@@ -218,14 +218,20 @@ struct libtouch_area {
 	/* maximum number of touchpoints */
 	int max_n;
 
+	/* transformation & derived values */
 	struct libtouch_rt F_accum, F_curr;
 	bool F_dirty;
 
-	/* user callbacks */
-	struct libtouch_area_ops ops;
+	/* velocity calculation logic */
+	struct {
+		bool started;
+		uint32_t last_t;
+		float last_p[2];
+		float val[2];
+	} V;
 
-	/* estimation mode */
-	enum libtouch_groups g;
+	/* options */
+	struct libtouch_area_opts opts;
 };
 
 struct libtouch_surface *libtouch_surface_create()
@@ -237,15 +243,16 @@ struct libtouch_surface *libtouch_surface_create()
 	return surf;
 }
 struct libtouch_area *libtouch_surface_add_area(struct libtouch_surface *surf,
-		const float *aabb, enum libtouch_groups g,
-		struct libtouch_area_ops ops)
+		const float *aabb, struct libtouch_area_opts opts)
 {
 	struct libtouch_area *area = calloc(1, sizeof(struct libtouch_area));
-	area->surf = surf;
-	area->aabb = aabb;
-	area->F_accum = area->F_curr = libtouch_rt_identity;
-	area->ops = ops;
-	area->g = g;
+	*area = (struct libtouch_area){
+		.surf = surf,
+		.aabb = aabb,
+		.F_accum = libtouch_rt_identity,
+		.F_curr = libtouch_rt_identity,
+		.opts = opts,
+	};
 
 	vec_append(&surf->areas, &area);
 
@@ -319,7 +326,8 @@ struct libtouch_rt libtouch_area_get_transform(struct libtouch_area *area)
 			.area = area,
 			.i = 0
 		};
-		struct libtouch_rt F = est_fn[area->g](&cl, &area_point_iter);
+		struct libtouch_rt F =
+			est_fn[area->opts.g](&cl, &area_point_iter);
 		area->F_curr = libtouch_rt_mul(&F, &area->F_accum);
 		area->F_dirty = false;
 	}
@@ -345,15 +353,29 @@ ok:
 	}
 }
 
-static bool area_down(struct libtouch_area *area, const struct tp *tp)
+static bool area_down(struct libtouch_area *area, const struct tp *tp,
+	uint32_t time)
 {
 	if (aabb_contains(area->aabb, tp->start)) {
 		area_accumulate(area);
 
 		if (area->n == 0) {
 			// first touchpoint, send start event
-			if (area->ops.start) {
-				area->ops.start(area->ops.env);
+			if (area->opts.start) {
+				struct libtouch_gesture_data data = {
+					.t = time,
+					.rt = area->F_accum,
+					.V[0] = 0, .V[1] = 0,
+				};
+				area->opts.start(area->opts.env, data);
+			}
+
+			if (area->opts.flags & LIBTOUCH_V) {
+				area->V.started = false;
+				area->V.last_t = time;
+				area->V.last_p[0] = area->F_accum.t[0];
+				area->V.last_p[1] = area->F_accum.t[1];
+				area->V.val[0] = area->V.val[1] = 0;
 			}
 		}
 		++area->n;
@@ -364,13 +386,19 @@ static bool area_down(struct libtouch_area *area, const struct tp *tp)
 	return false;
 }
 
-static void area_up(struct libtouch_area *area, const struct tp *tp)
+static void area_up(struct libtouch_area *area, const struct tp *tp,
+	uint32_t time)
 {
 	area_accumulate(area);
 	if (--area->n == 0) {
 		// last touchpoint left, we can dispatch gesture events
-		if (area->ops.end) {
-			area->ops.end(area->ops.env, area->F_accum);
+		if (area->opts.end) {
+			struct libtouch_gesture_data data = {
+				.t = time,
+				.rt = area->F_accum,
+				.V[0] = area->V.val[0], .V[1] = area->V.val[1],
+			};
+			area->opts.end(area->opts.env, data);
 			area->F_accum = libtouch_rt_identity;
 		}
 	}
@@ -380,9 +408,39 @@ static void area_motion(struct libtouch_area *area, const struct tp *tp,
 		uint32_t time, const float pos[static 2])
 {
 	area->F_dirty = true;
-	if (area->ops.move) {
-		area->ops.move(area->ops.env,
-			libtouch_area_get_transform(area));
+
+	if (area->opts.flags & LIBTOUCH_V && time > area->V.last_t) {
+		struct libtouch_rt rt = libtouch_area_get_transform(area);
+		uint32_t dt = time - area->V.last_t;
+		float val_new[2] = {
+			(rt.t[0] - area->V.last_p[0]) / dt,
+			(rt.t[1] - area->V.last_p[1]) / dt,
+		};
+		if (!area->V.started) {
+			area->V.val[0] = val_new[0];
+			area->V.val[1] = val_new[1];
+		} else {
+			/* for low pass filter idea, see:
+			 * https://mortoray.com/2015/04/08/measuring-finger-mouse-velocity-at-release-time */
+			static const float tau = 10; // TODO: make tau configurable
+			float alpha = 1 - expf(-(dt/tau));
+			area->V.val[0] += alpha * (val_new[0] - area->V.val[0]);
+			area->V.val[1] += alpha * (val_new[1] - area->V.val[1]);
+		}
+
+		area->V.started = true;
+		area->V.last_t = time;
+		area->V.last_p[0] = rt.t[0];
+		area->V.last_p[1] = rt.t[1];
+	}
+
+	if (area->opts.move) {
+		struct libtouch_gesture_data data = {
+			.t = time,
+			.rt = libtouch_area_get_transform(area),
+			.V[0] = area->V.val[0], .V[1] = area->V.val[1],
+		};
+		area->opts.move(area->opts.env, data);
 	}
 }
 
@@ -401,7 +459,7 @@ void libtouch_surface_down(struct libtouch_surface *surf, uint32_t time,
 	/* find the area that contains this point */
 	for (size_t i = 0; i < surf->areas.len; ++i) {
 		struct libtouch_area **area = vec_get(&surf->areas, i);
-		if (area_down(*area, &tp)) {
+		if (area_down(*area, &tp, time)) {
 			vec_append(&tp.areas, area);
 		}
 	}
@@ -428,7 +486,7 @@ void libtouch_surface_up(struct libtouch_surface *surf, uint32_t time, int id)
 	for (int i = 0; i < tp->areas.len; ++i) {
 		struct libtouch_area *area =
 			*(struct libtouch_area **)vec_get(&tp->areas, i);
-		area_up(area, tp);
+		area_up(area, tp, time);
 	}
 
 	/* remove this tp from the list */

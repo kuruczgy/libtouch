@@ -9,6 +9,10 @@ enum libtouch_groups {
 	LIBTOUCH_TSR,
 };
 
+enum libtouch_area_flags {
+	LIBTOUCH_V = 1 << 0,
+};
+
 /* Represents the affine transformation:
  * [ s -r t1 ]
  * [ r  s t2 ]
@@ -38,17 +42,35 @@ float libtouch_rt_scaling(const struct libtouch_rt *rt);
 struct libtouch_surface;
 struct libtouch_area;
 
-struct libtouch_area_ops {
+struct libtouch_gesture_data {
+	uint32_t t;
+	struct libtouch_rt rt;
+	float V[2];
+};
+
+struct libtouch_area_opts {
+	/* all callbacks can be set to NULL to disable them */
+
+	/* environment for all callbacks */
 	void *env;
-	void (*start)(void *env);
-	void (*move)(void *env, struct libtouch_rt rt);
-	void (*end)(void *env, struct libtouch_rt rt);
+
+	/* gesture start callback */
+	void (*start)(void *env, struct libtouch_gesture_data data);
+
+	/* callback during the gesture, when the transform changes */
+	void (*move)(void *env, struct libtouch_gesture_data data);
+
+	/* gesture end callback */
+	void (*end)(void *env, struct libtouch_gesture_data data);
+
+	/* various options */
+	enum libtouch_groups g;
+	enum libtouch_area_flags flags;
 };
 
 struct libtouch_surface *libtouch_surface_create();
 struct libtouch_area *libtouch_surface_add_area(struct libtouch_surface *surf,
-	const float *aabb, enum libtouch_groups g,
-	struct libtouch_area_ops ops);
+	const float *aabb, struct libtouch_area_opts opts);
 void libtouch_surface_remove_area(struct libtouch_surface *surf,
 	struct libtouch_area *area);
 void libtouch_surface_destroy(struct libtouch_surface *surf);
